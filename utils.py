@@ -1,0 +1,227 @@
+"""
+utils.py — Helper functions for Smart Study Path Generator
+===========================================================
+
+Contains:
+  - Day-wise schedule builder
+  - Study plan export (text / CSV)
+  - Sample data generator
+  - Difficulty stats computation
+"""
+
+import csv
+import io
+from typing import List, Dict, Tuple, Any
+from astar import Topic
+
+
+# ─── Day-Wise Schedule ────────────────────────────────────────────────────────
+
+def build_daily_schedule(
+    topics: List[Topic],
+    ordered_indices: List[int],
+    hours_per_day: float
+) -> List[Dict[str, Any]]:
+    """
+    Given an ordered list of topic indices, pack them into daily slots.
+
+    Returns a list of day dicts:
+        [
+          {
+            'day': 1,
+            'topics': [{'name': ..., 'time': ..., 'difficulty': ...}, ...],
+            'total_hours': 3.5,
+            'is_full': True
+          },
+          ...
+        ]
+
+    Topics that don't fit in the remaining hours of a day carry over to the next.
+    A topic is NEVER split across days — the day fills up to hours_per_day and
+    any topic that would exceed it starts on the next day.
+    """
+    days = []
+    current_day: Dict[str, Any] = {'day': 1, 'topics': [], 'total_hours': 0.0}
+    remaining_today = hours_per_day
+
+    for idx in ordered_indices:
+        topic = topics[idx]
+        t = topic.adjusted_time
+
+        # If topic doesn't fit today, start a new day
+        if t > remaining_today and current_day['topics']:
+            current_day['is_full'] = (remaining_today < hours_per_day * 0.15)
+            days.append(current_day)
+            current_day = {
+                'day': len(days) + 1,
+                'topics': [],
+                'total_hours': 0.0
+            }
+            remaining_today = hours_per_day
+
+        current_day['topics'].append({
+            'name': topic.name,
+            'adjusted_time': round(t, 2),
+            'base_time': topic.base_time,
+            'difficulty': topic.difficulty,
+            'familiarity': topic.familiarity,
+            'is_priority': topic.is_priority,
+        })
+        current_day['total_hours'] = round(current_day['total_hours'] + t, 2)
+        remaining_today -= t
+
+        # If exactly full, seal the day
+        if remaining_today <= 0:
+            current_day['is_full'] = True
+            days.append(current_day)
+            current_day = {
+                'day': len(days) + 1,
+                'topics': [],
+                'total_hours': 0.0
+            }
+            remaining_today = hours_per_day
+
+    # Add any remaining topics in the last partial day
+    if current_day['topics']:
+        current_day['is_full'] = False
+        days.append(current_day)
+
+    return days
+
+
+# ─── Stats ────────────────────────────────────────────────────────────────────
+
+def compute_stats(topics: List[Topic], ordered_indices: List[int]) -> Dict[str, Any]:
+    """Compute summary statistics for the generated plan."""
+    total_base = sum(topics[i].base_time for i in ordered_indices)
+    total_adjusted = sum(topics[i].adjusted_time for i in ordered_indices)
+
+    diff_counts = {'Easy': 0, 'Medium': 0, 'Hard': 0}
+    for i in ordered_indices:
+        diff_counts[topics[i].difficulty] += 1
+
+    avg_familiarity = (
+        sum(topics[i].familiarity for i in ordered_indices) / len(ordered_indices)
+        if ordered_indices else 0
+    )
+
+    time_saved = total_base * sum(
+        {'Easy': 1.0, 'Medium': 1.5, 'Hard': 2.0}[topics[i].difficulty]
+        for i in ordered_indices
+    ) - total_adjusted
+
+    return {
+        'total_base_hours': round(total_base, 2),
+        'total_adjusted_hours': round(total_adjusted, 2),
+        'time_saved_by_familiarity': round(max(time_saved, 0), 2),
+        'topic_count': len(ordered_indices),
+        'difficulty_distribution': diff_counts,
+        'avg_familiarity_pct': round(avg_familiarity, 1),
+    }
+
+
+def difficulty_progression(topics: List[Topic], ordered_indices: List[int]) -> List[Dict]:
+    """
+    Returns a list of (topic_name, cumulative_time, difficulty_num) for charting.
+    """
+    progression = []
+    cum_time = 0.0
+    for i in ordered_indices:
+        t = topics[i]
+        cum_time += t.adjusted_time
+        progression.append({
+            'topic': t.name,
+            'cumulative_hours': round(cum_time, 2),
+            'difficulty_num': t.difficulty_num,
+            'difficulty': t.difficulty,
+            'adjusted_time': round(t.adjusted_time, 2),
+        })
+    return progression
+
+
+# ─── Export ───────────────────────────────────────────────────────────────────
+
+def export_plan_text(
+    topics: List[Topic],
+    ordered_indices: List[int],
+    daily_schedule: List[Dict],
+    stats: Dict,
+    metadata: Dict
+) -> str:
+    """Generate a plain-text version of the study plan."""
+    lines = [
+        "=" * 60,
+        "     SMART STUDY PLAN — Generated by A* Algorithm",
+        "=" * 60,
+        f"\nTotal Topics  : {stats['topic_count']}",
+        f"Adjusted Time : {stats['total_adjusted_hours']}h",
+        f"Total Days    : {len(daily_schedule)}",
+        f"Algorithm     : {metadata.get('algorithm', 'A*')}",
+        f"Nodes Expanded: {metadata.get('nodes_expanded', '—')}",
+        "\n─── OPTIMAL STUDY ORDER ─────────────────────────────",
+    ]
+
+    for rank, idx in enumerate(ordered_indices, 1):
+        t = topics[idx]
+        priority_tag = " ⭐ PRIORITY" if t.is_priority else ""
+        lines.append(
+            f"  {rank:2}. [{t.difficulty:6}] {t.name}"
+            f"  ({t.adjusted_time:.1f}h adjusted | familiarity {t.familiarity}%){priority_tag}"
+        )
+
+    lines.append("\n─── DAY-WISE SCHEDULE ───────────────────────────────")
+    for day in daily_schedule:
+        lines.append(f"\n  📅 Day {day['day']}  ({day['total_hours']:.1f}h)")
+        for topic_info in day['topics']:
+            lines.append(
+                f"      • {topic_info['name']}  "
+                f"[{topic_info['difficulty']}]  {topic_info['adjusted_time']:.1f}h"
+            )
+
+    lines.append("\n" + "=" * 60)
+    return "\n".join(lines)
+
+
+def export_plan_csv(
+    topics: List[Topic],
+    ordered_indices: List[int],
+    daily_schedule: List[Dict]
+) -> str:
+    """Generate a CSV string for download."""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Day', 'Order', 'Topic', 'Difficulty', 'Base Hours',
+                     'Adjusted Hours', 'Familiarity %', 'Priority'])
+
+    order = 1
+    for day in daily_schedule:
+        for topic_info in day['topics']:
+            writer.writerow([
+                day['day'],
+                order,
+                topic_info['name'],
+                topic_info['difficulty'],
+                topic_info['base_time'],
+                topic_info['adjusted_time'],
+                topic_info['familiarity'],
+                '✓' if topic_info['is_priority'] else '',
+            ])
+            order += 1
+
+    return output.getvalue()
+
+
+# ─── Sample Data ──────────────────────────────────────────────────────────────
+
+def get_sample_topics() -> List[Topic]:
+    """Sample topics for quick testing / demo."""
+    return [
+        Topic("Python Basics",        difficulty='Easy',   base_time=2.0, familiarity=70),
+        Topic("Data Structures",      difficulty='Medium', base_time=4.0, familiarity=40),
+        Topic("Algorithms (Sorting)", difficulty='Medium', base_time=3.0, familiarity=30),
+        Topic("Graph Theory",         difficulty='Hard',   base_time=5.0, familiarity=10, is_priority=True),
+        Topic("Dynamic Programming",  difficulty='Hard',   base_time=6.0, familiarity=5),
+        Topic("Machine Learning 101", difficulty='Medium', base_time=4.0, familiarity=20),
+        Topic("Linear Algebra",       difficulty='Medium', base_time=3.5, familiarity=50),
+        Topic("Probability & Stats",  difficulty='Medium', base_time=3.0, familiarity=35),
+    ]
